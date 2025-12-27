@@ -1,0 +1,713 @@
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Cyborg Sorcerer: Particle Core</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Consolas', monospace; }
+        
+        /* Main Canvas */
+        #c { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+
+        /* HUD Overlay */
+        .hud-panel {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 240px; height: 180px;
+            border: 2px solid #00ffcc;
+            background: rgba(0, 10, 5, 0.8);
+            z-index: 10;
+            overflow: hidden;
+            border-radius: 4px;
+        }
+        #hud_canvas { width: 100%; height: 100%; transform: scaleX(-1); }
+
+        /* System Status */
+        #status-box {
+            position: absolute; top: 20px; left: 20px; color: #00ffcc; z-index: 10;
+            pointer-events: none;
+        }
+        h1 { margin: 0; font-size: 1.5rem; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px #00ffcc; }
+        .sub-text { font-size: 0.9rem; color: #aaa; margin-top: 5px; }
+        .stat-row { margin-top: 5px; font-size: 0.8rem; }
+        .highlight { color: #fff; font-weight: bold; }
+
+        .input_video { display: none; }
+    </style>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="status-box">
+        <h1 id="sys-title">SYSTEM: OFFLINE</h1>
+        <div class="sub-text" id="gesture-text">WAITING FOR NEURAL LINK...</div>
+        <div class="stat-row">PARTICLE SHAPE: <span id="shape-name" class="highlight">INITIALIZING</span></div>
+        <div class="stat-row">CORE STABILITY: <span id="core-stab" class="highlight">100%</span></div>
+    </div>
+
+    <canvas id="c"></canvas>
+
+    <div class="hud-panel">
+        <canvas id="hud_canvas"></canvas>
+    </div>
+    
+    <video class="input_video"></video>
+
+<script>
+    // ================= CONFIGURATION =================
+    const config = {
+        jointColor: 0x0088ff,
+        shieldColor: 0x00ffff,
+        chargeColor: 0xff3300,
+        particleCount: 4000
+    };
+
+    // ================= 1. UTILITIES (Mandala Texture) =================
+    function createMandala() {
+        const cvs = document.createElement('canvas'); cvs.width = 512; cvs.height = 512;
+        const ctx = cvs.getContext('2d'); const cx = 256, cy = 256;
+        ctx.strokeStyle = '#fff'; ctx.shadowBlur = 20; ctx.shadowColor = '#fff';
+        ctx.beginPath(); ctx.arc(cx, cy, 180, 0, Math.PI*2); ctx.lineWidth=5; ctx.stroke();
+        ctx.beginPath(); ctx.arc(cx, cy, 160, 0, Math.PI*2); ctx.lineWidth=2; ctx.stroke();
+        ctx.lineWidth=2;
+        for(let i=0; i<8; i++) {
+            ctx.save(); ctx.translate(cx, cy); ctx.rotate(i * Math.PI/4);
+            ctx.strokeRect(-120, -120, 240, 240);
+            ctx.restore();
+        }
+        return new THREE.CanvasTexture(cvs);
+    }
+
+    // ================= 2. THREE.JS SETUP =================
+    const canvas = document.querySelector('#c');
+    const renderer = new THREE.WebGLRenderer({canvas, antialias: false});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    
+    const scene = new THREE.Scene();
+    // Dark fog for depth
+    scene.fog = new THREE.FogExp2(0x000000, 0.015);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 200);
+    camera.position.z = 40;
+
+    // Post-Processing (Bloom)
+    const composer = new THREE.EffectComposer(renderer);
+    composer.addPass(new THREE.RenderPass(scene, camera));
+    const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(window.innerWidth,window.innerHeight), 1.5, 0.4, 0.85);
+    composer.addPass(bloom);
+
+    // ================= 3. CYBORG HAND SETUP =================
+    const handGroup = new THREE.Group();
+    scene.add(handGroup);
+    handGroup.visible = false; // Hide until detected
+
+    // Meshes
+    const jointGeo = new THREE.SphereGeometry(0.5, 12, 12);
+    const jointMat = new THREE.MeshBasicMaterial({ color: config.jointColor });
+    const boneGeo = new THREE.CylinderGeometry(0.2, 0.2, 1, 6);
+    const boneMat = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.5 });
+
+    const joints = [];
+    const bones = [];
+
+    // Create 21 Joints
+    for(let i=0; i<21; i++) {
+        const mesh = new THREE.Mesh(jointGeo, jointMat);
+        handGroup.add(mesh);
+        joints.push(mesh);
+    }
+
+    // Bones Connections
+    const connections = [
+        [0,1],[1,2],[2,3],[3,4], [0,5],[5,6],[6,7],[7,8], [0,9],[9,10],[10,11],[11,12],
+        [0,13],[13,14],[14,15],[15,16], [0,17],[17,18],[18,19],[19,20]
+    ];
+    connections.forEach(pair => {
+        const mesh = new THREE.Mesh(boneGeo, boneMat);
+        handGroup.add(mesh);
+        bones.push({ mesh, start: pair[0], end: pair[1] });
+    });
+
+    // ================= 4. MAGIC SHIELD SETUP =================
+    const shieldGroup = new THREE.Group();
+    handGroup.add(shieldGroup); 
+
+    const shieldMat = new THREE.MeshBasicMaterial({ 
+        map: createMandala(), color: config.shieldColor, 
+        transparent: true, opacity: 0.9, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false 
+    });
+    const layer1 = new THREE.Mesh(new THREE.PlaneGeometry(14,14), shieldMat);
+    const layer2 = new THREE.Mesh(new THREE.PlaneGeometry(14,14), shieldMat.clone());
+    layer2.scale.set(0.6,0.6,0.6);
+    shieldGroup.add(layer1, layer2);
+
+    // ================= 5. PARTICLE SYSTEM SETUP =================
+    const pGeo = new THREE.BufferGeometry();
+    const pPos = new Float32Array(config.particleCount * 3);
+    const pTarget = new Float32Array(config.particleCount * 3); // Where it wants to go (Shape)
+    const pColor = new Float32Array(config.particleCount * 3);
+    
+    // Init random positions
+    for(let i=0; i<config.particleCount*3; i++) {
+        pPos[i] = (Math.random() - 0.5) * 100;
+        pTarget[i] = pPos[i];
+        pColor[i] = 1.0;
+    }
+    pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+    pGeo.setAttribute('color', new THREE.BufferAttribute(pColor, 3));
+
+    const pMat = new THREE.PointsMaterial({
+        size: 0.4, vertexColors: true, blending: THREE.AdditiveBlending, 
+        depthTest: false, transparent: true
+    });
+    const particleSystem = new THREE.Points(pGeo, pMat);
+    scene.add(particleSystem);
+
+    // Particle Shapes Logic
+    const shapes = ['sphere', 'cube', 'ring', 'galaxy'];
+    let currentShapeIdx = 0;
+
+    function updateParticleTargets(shape) {
+        document.getElementById('shape-name').innerText = shape.toUpperCase();
+        for(let i=0; i<config.particleCount; i++) {
+            const ix = i*3;
+            let x,y,z;
+            
+            if(shape === 'sphere') {
+                const phi = Math.acos(-1 + (2 * i) / config.particleCount);
+                const theta = Math.sqrt(config.particleCount * Math.PI) * phi;
+                const r = 25;
+                x = r * Math.cos(theta) * Math.sin(phi);
+                y = r * Math.sin(theta) * Math.sin(phi);
+                z = r * Math.cos(phi);
+            } else if (shape === 'cube') {
+                const s = 40;
+                x = (Math.random()-0.5)*s; y = (Math.random()-0.5)*s; z = (Math.random()-0.5)*s;
+            } else if (shape === 'ring') {
+                const ang = (i/config.particleCount) * Math.PI * 20;
+                const r = 15 + Math.random()*5;
+                x = Math.cos(ang)*r; y = (Math.random()-0.5)*10; z = Math.sin(ang)*r;
+            } else { // Galaxy
+                const ang = i * 0.1;
+                const r = i * 0.01;
+                x = Math.cos(ang)*r*10; y = (Math.random()-0.5)*5; z = Math.sin(ang)*r*10;
+            }
+
+            pTarget[ix] = x; pTarget[ix+1] = y; pTarget[ix+2] = z;
+            
+            // Default Blue/Cyan Colors
+            pColor[ix] = 0.0; pColor[ix+1] = 0.5 + Math.random()*0.5; pColor[ix+2] = 1.0;
+        }
+        pGeo.attributes.color.needsUpdate = true;
+    }
+    
+    // Cycle shapes every 8 seconds
+    setInterval(() => {
+        currentShapeIdx = (currentShapeIdx + 1) % shapes.length;
+        updateParticleTargets(shapes[currentShapeIdx]);
+    }, 8000);
+    updateParticleTargets('sphere');
+
+    // ================= 6. LOGIC & MEDIAPIPE =================
+    
+    // State
+    let isFist = false;
+    let handDetected = false;
+    let palmPosition = new THREE.Vector3(0,0,0);
+
+    // HUD Setup
+    const videoEl = document.querySelector('.input_video');
+    const hudCanvas = document.getElementById('hud_canvas');
+    const hudCtx = hudCanvas.getContext('2d');
+
+    // Hand helper
+    function alignBone(mesh, p1, p2) {
+        const dist = p1.distanceTo(p2);
+        mesh.position.copy(p1).lerp(p2, 0.5);
+        mesh.scale.set(1, dist, 1);
+        mesh.lookAt(p2);
+        mesh.rotateX(Math.PI / 2);
+    }
+
+    function onResults(results) {
+        // Draw HUD
+        hudCanvas.width = videoEl.videoWidth; hudCanvas.height = videoEl.videoHeight;
+        hudCtx.drawImage(results.image, 0, 0);
+
+        if(results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            handDetected = true;
+            handGroup.visible = true;
+            document.getElementById('sys-title').innerText = "SYSTEM: LINKED";
+            document.getElementById('sys-title').style.color = "#00ffcc";
+            
+            const lm = results.multiHandLandmarks[0];
+            drawConnectors(hudCtx, lm, HAND_CONNECTIONS, {color: '#00ffcc', lineWidth: 2});
+
+            // 1. Update Skeleton
+            const worldPositions = [];
+            const depthScale = 40;
+            
+            lm.forEach((p, i) => {
+                // Map to 3D Scene
+                const x = (1 - p.x - 0.5) * 50; // Invert X for mirroring
+                const y = (0.5 - p.y) * 40;
+                const z = p.z * -depthScale; 
+                const pos = new THREE.Vector3(x, y, z);
+                joints[i].position.copy(pos);
+                worldPositions.push(pos);
+            });
+
+            // Update Bones
+            bones.forEach(b => alignBone(b.mesh, worldPositions[b.start], worldPositions[b.end]));
+
+            // 2. Update Shield (Palm Center)
+            // Center between Wrist(0), Index(5), Pinky(17)
+            const p1 = worldPositions[0];
+            const p2 = worldPositions[9];
+            palmPosition.copy(p1).lerp(p2, 0.5); // Global Palm Position
+            
+            shieldGroup.position.copy(palmPosition);
+            shieldGroup.position.z += 2; // Offset slightly
+
+            // Orientation (Palm Normal)
+            const v1 = new THREE.Vector3().subVectors(worldPositions[5], worldPositions[0]);
+            const v2 = new THREE.Vector3().subVectors(worldPositions[17], worldPositions[0]);
+            const normal = new THREE.Vector3().crossVectors(v1, v2).normalize();
+            const targetQ = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), new THREE.Vector3(-normal.x, -normal.y, normal.z));
+            shieldGroup.quaternion.slerp(targetQ, 0.2);
+
+            // 3. Detect Fist (Charge)
+            const tips = [8,12,16,20];
+            let d = 0;
+            tips.forEach(t => d += worldPositions[t].distanceTo(worldPositions[0]));
+            isFist = (d / 4) < 9; // Threshold
+
+            // Update UI
+            const statusText = document.getElementById('gesture-text');
+            if(isFist) {
+                statusText.innerText = "MODE: GRAVITY WELL (CHARGING)";
+                statusText.style.color = "#ff3300";
+            } else {
+                statusText.innerText = "MODE: MATTER MANIPULATION (IDLE)";
+                statusText.style.color = "#00ffcc";
+            }
+
+        } else {
+            handDetected = false;
+            handGroup.visible = false;
+            document.getElementById('sys-title').innerText = "SYSTEM: SCANNING...";
+            document.getElementById('sys-title').style.color = "#ffff00";
+        }
+    }
+
+    // Init MediaPipe
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6});
+    hands.onResults(onResults);
+    
+    const cam = new Camera(videoEl, {onFrame: async()=>{await hands.send({image:videoEl})}, width:640, height:480});
+    cam.start();
+
+    // ================= 7. RENDER LOOP =================
+    function animate() {
+        requestAnimationFrame(animate);
+
+        // --- Visual Effects ---
+        if(handDetected) {
+            if(isFist) {
+                // Charge Mode
+                layer1.material.color.setHex(config.chargeColor);
+                layer2.material.color.setHex(config.chargeColor);
+                layer1.rotation.z -= 0.2;
+                layer2.rotation.z += 0.4;
+                bloom.strength = 3.0;
+                // Shake
+                handGroup.position.set((Math.random()-0.5)*0.5, (Math.random()-0.5)*0.5, 0);
+            } else {
+                // Idle Mode
+                layer1.material.color.setHex(config.shieldColor);
+                layer2.material.color.setHex(config.shieldColor);
+                layer1.rotation.z += 0.01;
+                layer2.rotation.z -= 0.02;
+                bloom.strength = 1.5;
+                handGroup.position.set(0,0,0);
+            }
+        }
+
+        // --- Particle Physics ---
+        const posArr = pGeo.attributes.position.array;
+        const colArr = pGeo.attributes.color.array;
+
+        for(let i=0; i<config.particleCount; i++) {
+            const ix = i*3; const iy = i*3+1; const iz = i*3+2;
+
+            // 1. Drift to Target Shape (Base Movement)
+            posArr[ix] += (pTarget[ix] - posArr[ix]) * 0.02;
+            posArr[iy] += (pTarget[iy] - posArr[iy]) * 0.02;
+            posArr[iz] += (pTarget[iz] - posArr[iz]) * 0.02;
+
+            // 2. Interaction with Hand
+            if(handDetected) {
+                const dx = posArr[ix] - palmPosition.x;
+                const dy = posArr[iy] - palmPosition.y;
+                const dz = posArr[iz] - palmPosition.z;
+                const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+                if(isFist) {
+                    // ATTRACTION (Black Hole)
+                    if(dist < 40) {
+                        const force = 0.15; // Strong pull
+                        posArr[ix] -= dx * force;
+                        posArr[iy] -= dy * force;
+                        posArr[iz] -= dz * force;
+                        
+                        // Turn Red
+                        colArr[ix] = 1; colArr[iy] = 0.2; colArr[iz] = 0;
+                    }
+                } else {
+                    // REPEL (Force Field)
+                    if(dist < 15) {
+                        const force = (15 - dist) / 15;
+                        posArr[ix] += dx * force * 0.5;
+                        posArr[iy] += dy * force * 0.5;
+                        posArr[iz] += dz * force * 0.5;
+                        
+                        // Turn Bright White/Cyan
+                        colArr[ix] = 0.5; colArr[iy] = 1; colArr[iz] = 1;
+                    } else {
+                        // Reset color slowly
+                        colArr[ix] += (pColor[ix] - colArr[ix]) * 0.05;
+                        colArr[iy] += (pColor[iy] - colArr[iy]) * 0.05;
+                        colArr[iz] += (pColor[iz] - colArr[iz]) * 0.05;
+                    }
+                }
+            }
+        }
+        pGeo.attributes.position.needsUpdate = true;
+        pGeo.attributes.color.needsUpdate = true;
+        
+        // Rotate entire particle system slowly
+        particleSystem.rotation.y += 0.001;
+
+        composer.render();
+    }
+    animate();
+
+    // Resize Handler
+    window.onresize = () => {
+        camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight); composer.setSize(window.innerWidth, window.innerHeight);
+    };
+
+</script>
+</body>
+</html> -->
+
+
+
+
+
+<!-- Sheild Removed -->
+
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Cyborg Sorcerer: No Shield</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Consolas', monospace; }
+        #c { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        .hud-panel {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 240px; height: 180px;
+            border: 2px solid #00ffcc;
+            background: rgba(0, 10, 5, 0.8);
+            z-index: 10;
+            border-radius: 4px;
+        }
+        #hud_canvas { width: 100%; height: 100%; transform: scaleX(-1); }
+        #status-box {
+            position: absolute; top: 20px; left: 20px; color: #00ffcc; z-index: 10; pointer-events: none;
+        }
+        h1 { margin: 0; font-size: 1.5rem; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px #00ffcc; }
+        .stat-row { margin-top: 5px; font-size: 0.8rem; color: #aaa; }
+        .highlight { color: #fff; font-weight: bold; }
+        .input_video { display: none; }
+    </style>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="status-box">
+        <h1 id="sys-title">SYSTEM: OFFLINE</h1>
+        <div class="stat-row">PARTICLE SHAPE: <span id="shape-name" class="highlight">INITIALIZING</span></div>
+        <div class="stat-row">STATUS: <span id="gesture-text" class="highlight">WAITING</span></div>
+    </div>
+
+    <canvas id="c"></canvas>
+    <div class="hud-panel"><canvas id="hud_canvas"></canvas></div>
+    <video class="input_video"></video>
+
+<script>
+    const config = { jointColor: 0x0088ff, chargeColor: 0xff3300, particleCount: 4000 };
+
+    // --- THREE.JS SETUP ---
+    const canvas = document.querySelector('#c');
+    const renderer = new THREE.WebGLRenderer({canvas, antialias: false});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000000, 0.015);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 200);
+    camera.position.z = 40;
+
+    const composer = new THREE.EffectComposer(renderer);
+    composer.addPass(new THREE.RenderPass(scene, camera));
+    const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(window.innerWidth,window.innerHeight), 1.5, 0.4, 0.85);
+    composer.addPass(bloom);
+
+    // --- CYBORG HAND (SKELETON ONLY) ---
+    const handGroup = new THREE.Group();
+    scene.add(handGroup);
+    handGroup.visible = false;
+
+    const jointGeo = new THREE.SphereGeometry(0.5, 8, 8);
+    const jointMat = new THREE.MeshBasicMaterial({ color: config.jointColor });
+    const boneGeo = new THREE.CylinderGeometry(0.2, 0.2, 1, 6);
+    const boneMat = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.5 });
+
+    const joints = [];
+    const bones = [];
+
+    for(let i=0; i<21; i++) {
+        const mesh = new THREE.Mesh(jointGeo, jointMat);
+        handGroup.add(mesh);
+        joints.push(mesh);
+    }
+
+    const connections = [
+        [0,1],[1,2],[2,3],[3,4], [0,5],[5,6],[6,7],[7,8], [0,9],[9,10],[10,11],[11,12],
+        [0,13],[13,14],[14,15],[15,16], [0,17],[17,18],[18,19],[19,20]
+    ];
+    connections.forEach(pair => {
+        const mesh = new THREE.Mesh(boneGeo, boneMat);
+        handGroup.add(mesh);
+        bones.push({ mesh, start: pair[0], end: pair[1] });
+    });
+
+    // --- PARTICLE SYSTEM ---
+    const pGeo = new THREE.BufferGeometry();
+    const pPos = new Float32Array(config.particleCount * 3);
+    const pTarget = new Float32Array(config.particleCount * 3);
+    const pColor = new Float32Array(config.particleCount * 3);
+    
+    for(let i=0; i<config.particleCount*3; i++) {
+        pPos[i] = (Math.random() - 0.5) * 100;
+        pTarget[i] = pPos[i];
+        pColor[i] = 1.0;
+    }
+    pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+    pGeo.setAttribute('color', new THREE.BufferAttribute(pColor, 3));
+
+    const pMat = new THREE.PointsMaterial({
+        size: 0.4, vertexColors: true, blending: THREE.AdditiveBlending, depthTest: false, transparent: true
+    });
+    const particleSystem = new THREE.Points(pGeo, pMat);
+    scene.add(particleSystem);
+
+    const shapes = ['sphere', 'cube', 'ring', 'galaxy'];
+    let currentShapeIdx = 0;
+
+    function updateParticleTargets(shape) {
+        document.getElementById('shape-name').innerText = shape.toUpperCase();
+        for(let i=0; i<config.particleCount; i++) {
+            const ix = i*3;
+            let x,y,z;
+            if(shape === 'sphere') {
+                const phi = Math.acos(-1 + (2 * i) / config.particleCount);
+                const theta = Math.sqrt(config.particleCount * Math.PI) * phi;
+                const r = 25;
+                x = r * Math.cos(theta) * Math.sin(phi); y = r * Math.sin(theta) * Math.sin(phi); z = r * Math.cos(phi);
+            } else if (shape === 'cube') {
+                const s = 40;
+                x = (Math.random()-0.5)*s; y = (Math.random()-0.5)*s; z = (Math.random()-0.5)*s;
+            } else if (shape === 'ring') {
+                const ang = (i/config.particleCount) * Math.PI * 20;
+                const r = 15 + Math.random()*5;
+                x = Math.cos(ang)*r; y = (Math.random()-0.5)*10; z = Math.sin(ang)*r;
+            } else { 
+                const ang = i * 0.1; const r = i * 0.01;
+                x = Math.cos(ang)*r*10; y = (Math.random()-0.5)*5; z = Math.sin(ang)*r*10;
+            }
+            pTarget[ix] = x; pTarget[ix+1] = y; pTarget[ix+2] = z;
+            pColor[ix] = 0.0; pColor[ix+1] = 0.5 + Math.random()*0.5; pColor[ix+2] = 1.0;
+        }
+        pGeo.attributes.color.needsUpdate = true;
+    }
+    
+    setInterval(() => {
+        currentShapeIdx = (currentShapeIdx + 1) % shapes.length;
+        updateParticleTargets(shapes[currentShapeIdx]);
+    }, 8000);
+    updateParticleTargets('sphere');
+
+    // --- LOGIC ---
+    let isFist = false;
+    let handDetected = false;
+    let palmPosition = new THREE.Vector3(0,0,0);
+    const hudCanvas = document.getElementById('hud_canvas');
+    const hudCtx = hudCanvas.getContext('2d');
+    const videoEl = document.querySelector('.input_video');
+
+    function alignBone(mesh, p1, p2) {
+        const dist = p1.distanceTo(p2);
+        mesh.position.copy(p1).lerp(p2, 0.5);
+        mesh.scale.set(1, dist, 1);
+        mesh.lookAt(p2);
+        mesh.rotateX(Math.PI / 2);
+    }
+
+    function onResults(results) {
+        hudCanvas.width = videoEl.videoWidth; hudCanvas.height = videoEl.videoHeight;
+        hudCtx.drawImage(results.image, 0, 0);
+
+        if(results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            handDetected = true;
+            handGroup.visible = true;
+            document.getElementById('sys-title').innerText = "SYSTEM: LINKED";
+            
+            const lm = results.multiHandLandmarks[0];
+            const worldPositions = [];
+            const depthScale = 40;
+            
+            lm.forEach((p, i) => {
+                const x = (1 - p.x - 0.5) * 50; 
+                const y = (0.5 - p.y) * 40;
+                const z = p.z * -depthScale; 
+                const pos = new THREE.Vector3(x, y, z);
+                joints[i].position.copy(pos);
+                worldPositions.push(pos);
+            });
+
+            bones.forEach(b => alignBone(b.mesh, worldPositions[b.start], worldPositions[b.end]));
+
+            // Palm Center
+            palmPosition.copy(worldPositions[0]).lerp(worldPositions[9], 0.5);
+
+            // Fist Logic
+            const tips = [8,12,16,20];
+            let d = 0;
+            tips.forEach(t => d += worldPositions[t].distanceTo(worldPositions[0]));
+            isFist = (d / 4) < 9;
+
+            const statusText = document.getElementById('gesture-text');
+            if(isFist) {
+                statusText.innerText = "GRAVITY WELL (ACTIVE)";
+                statusText.style.color = "#ff3300";
+            } else {
+                statusText.innerText = "MATTER MANIPULATION (IDLE)";
+                statusText.style.color = "#00ffcc";
+            }
+        } else {
+            handDetected = false;
+            handGroup.visible = false;
+            document.getElementById('sys-title').innerText = "SYSTEM: SCANNING...";
+        }
+    }
+
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6});
+    hands.onResults(onResults);
+    
+    const cam = new Camera(videoEl, {onFrame: async()=>{await hands.send({image:videoEl})}, width:640, height:480});
+    cam.start();
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        // Visuals (Skeleton Color Change)
+        if(handDetected) {
+            joints.forEach(j => j.material.color.setHex(isFist ? config.chargeColor : config.jointColor));
+            bloom.strength = isFist ? 3.0 : 1.5;
+        }
+
+        // Physics
+        const posArr = pGeo.attributes.position.array;
+        const colArr = pGeo.attributes.color.array;
+
+        for(let i=0; i<config.particleCount; i++) {
+            const ix = i*3; const iy = i*3+1; const iz = i*3+2;
+
+            // Drift
+            posArr[ix] += (pTarget[ix] - posArr[ix]) * 0.02;
+            posArr[iy] += (pTarget[iy] - posArr[iy]) * 0.02;
+            posArr[iz] += (pTarget[iz] - posArr[iz]) * 0.02;
+
+            // Interaction
+            if(handDetected) {
+                const dx = posArr[ix] - palmPosition.x;
+                const dy = posArr[iy] - palmPosition.y;
+                const dz = posArr[iz] - palmPosition.z;
+                const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+                if(isFist) { // ATTRACT
+                    if(dist < 40) {
+                        const force = 0.15;
+                        posArr[ix] -= dx * force; posArr[iy] -= dy * force; posArr[iz] -= dz * force;
+                        colArr[ix] = 1; colArr[iy] = 0.2; colArr[iz] = 0;
+                    }
+                } else { // REPEL
+                    if(dist < 15) {
+                        const force = (15 - dist) / 15;
+                        posArr[ix] += dx * force * 0.5; posArr[iy] += dy * force * 0.5; posArr[iz] += dz * force * 0.5;
+                        colArr[ix] = 0.5; colArr[iy] = 1; colArr[iz] = 1;
+                    } else {
+                        colArr[ix] += (pColor[ix] - colArr[ix]) * 0.05;
+                        colArr[iy] += (pColor[iy] - colArr[iy]) * 0.05;
+                        colArr[iz] += (pColor[iz] - colArr[iz]) * 0.05;
+                    }
+                }
+            }
+        }
+        pGeo.attributes.position.needsUpdate = true;
+        pGeo.attributes.color.needsUpdate = true;
+        particleSystem.rotation.y += 0.001;
+        composer.render();
+    }
+    animate();
+
+    window.onresize = () => {
+        camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight); composer.setSize(window.innerWidth, window.innerHeight);
+    };
+</script>
+</body>
+</html> -->
+
+
+
+
+
